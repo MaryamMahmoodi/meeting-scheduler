@@ -2,18 +2,39 @@ spring:
   application:
     name: meeting-scheduler
   datasource:
-    url: ${DB_URL:jdbc:postgresql://localhost:5433/postgres}
-    username: ${DB_USERNAME:postgres}
-    password: ${DB_PASSWORD:postgres}
-    hikari:
-      maximum-pool-size: 10
-      connection-timeout: 3000
+    url: jdbc:postgresql://${DB_HOST:localhost}:${DB_PORT:5432}/${DB_NAME:minidood}
+    username: ${DB_USER:minidood}
+    password: ${DB_PASSWORD:minidood}
+  jpa:
+    open-in-view: false
+    hibernate:
+      ddl-auto: validate # Schema is managed by Flyway; Hibernate only validates
+    properties:
+      hibernate:
+        jdbc:
+          time_zone: UTC
   flyway:
     enabled: true
-server:
-  port: ${SERVER_PORT:8080}
+  jackson:
+    deserialization:
+      fail-on-unknown-properties: true
+      adjust-dates-to-context-time-zone: false
+      fail-on-numbers-for-enums: true
+      fail-on-trailing-tokens: true
+    serialization:
+      write-dates-as-timestamps: false
+  mvc:
+    problemdetails:
+      enabled: true
+
 management:
   endpoints:
     web:
       exposure:
-        include: health,info,metrics
+        include: health,info
+
+springdoc:
+  api-docs:
+    version: openapi_3_1
+  swagger-ui:
+    url: /openapi.yaml

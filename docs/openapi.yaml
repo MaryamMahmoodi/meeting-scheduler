@@ -1,0 +1,1068 @@
+openapi: 3.1.0
+info:
+  title: mini-dood API
+  version: 1.0.0
+  summary: Lightweight meeting scheduling backend inspired by Doodle.
+  description: |
+    `mini-dood` lets users publish time slots in their personal calendar, mark them `FREE` or `BUSY`,
+    and book meetings out of their free slots. **This file is the canonical API contract**; the
+    implementation and the Swagger UI follow it.
+
+    ## Domain rules
+
+    * A user's personal calendar is an internal domain concept (the user's slots and meetings).
+      There are no calendar resources or `/calendars` endpoints.
+    * A time slot's `endTime` must be strictly after its `startTime`.
+    * Slots of the same user must not overlap. Two intervals overlap when
+      `existing.start < requested.end AND existing.end > requested.start`.
+      Adjacent slots (one ends exactly when the next starts) are allowed.
+      Overlapping slots are rejected with `409`.
+    * A meeting can only be created from a `FREE` slot that belongs to its organizer. The meeting takes
+      its start and end from that slot. A successful booking marks the slot `BUSY` in the same
+      database transaction as the meeting insert.
+    * A slot that has been booked by a meeting is immutable: it cannot be updated, have its
+      availability changed, or be deleted (`409`, `slot-booked`). Meeting cancellation is not part of this API.
+    * Unknown resources return `404`. A slot addressed through another user's path is treated as unknown
+      (`404`), so a user cannot read or modify a slot they do not own.
+    * Scheduling conflicts (overlapping slots, booking a `BUSY` slot, changing a booked slot,
+      duplicate email) return `409`.
+
+    ## Availability semantics
+
+    Explicitly defined slots represent *known* availability. A gap between slots means availability
+    is **unknown**, not free. The availability endpoint never infers free time from gaps and never merges intervals.
+
+    ## Participants
+
+    Participants are stored as user IDs. Only the organizer's slot is reserved when a meeting is booked.
+    Participant availability is **not checked and not reserved**. A user's meeting list contains the
+    meetings they organize and the meetings in which they are a participant.
+
+    ## Security
+
+    There is no authentication or authorization. A user ID in a path only identifies a resource;
+    it is not proof of identity.
+
+    ## Conventions
+
+    * All paths are prefixed with `/api/v1`.
+    * Identifiers are UUIDs. Timestamps are ISO-8601 date-times that carry an offset. Requests may use any offset
+      (for example `2026-11-02T10:00:00+01:00` in a JSON body); responses are always in UTC (`Z`).
+      In a query string a `+` must be sent as `%2B` (a literal `+` decodes to a space and is rejected
+      with `400`); using `Z` avoids the issue.
+      Timestamps are truncated to microsecond precision on input, before any validation or overlap check,
+      and persisted with that precision. Supported timestamps lie between `0001-01-01T00:00:00Z` and
+      `9999-12-31T23:59:59.999999Z` (inclusive); anything outside is rejected with `400` `validation-error`
+      (`field` = the property or query parameter). Timestamps must be JSON strings, never numbers.
+    * Text values (`name`, `email`, `title`, `description`) must not contain the NUL character (U+0000):
+      rejected with `400` `validation-error`.
+    * Time ranges (`from`, `to`) are half-open intervals `[from, to)` and `from` must be before `to`.
+      A slot or meeting is part of a range when it **intersects** it
+      (`start < to AND end > from`); entries are returned whole, never clipped. Results are
+      sorted by `startTime` ascending and are not paginated. Meetings with equal `startTime` are ordered
+      by `endTime` ascending, then `id` ascending (the slots of one user cannot overlap, so slot and
+      availability lists never tie).
+    * Errors use RFC 9457 Problem Details (`application/problem+json`). Unexpected server failures
+      return `500` with the same structure (`type` = `urn:mini-dood:problem:internal-error`).
+      Errors raised by the framework before a request reaches an operation (unknown path `404`,
+      `405` method not allowed, `406` not acceptable, `415` unsupported media type) use the same media type
+      with `type` = `about:blank`. They are not declared per operation. Request bodies must be sent
+      as `application/json`.
+    * `400` problem types. `validation-error` (always with `errors[]`, one entry per violation) is used for a
+      violated constraint or rule on readable input: a missing or blank required body property, a size or
+      format constraint, a timestamp outside the supported range, a NUL character in a text value,
+      `endTime` not after `startTime` (`field` = `endTime`), `from` not before `to`
+      (`field` = `to`), a missing required query parameter (`field` = its name; when several are missing only the first is reported), and an organizer, duplicate
+      or `null` entry in `participantIds` (`field` = `participantIds`). `malformed-request` (no `errors[]`) is used
+      when the input cannot be read: invalid JSON, a wrong JSON type (for example a number where a string is
+      expected, or a numeric timestamp), an unknown body property, an invalid enum value, a malformed UUID,
+      or a malformed timestamp (including one without an offset).
+    * When several errors apply to one request, the first failing check in this order determines the response:
+      1. `400`: request validation (path, query and body);
+      2. `404`: existence, in the order user in the path, then slot (or meeting), then participants;
+      3. `409`: state conflicts, `slot-booked` (slot endpoints) or `slot-not-free` (booking) before `slot-overlap`.
+
+      Examples: an invalid body for an unknown user returns `400`; booking a `BUSY` slot with an unknown
+      participant returns `404`; updating a booked slot to a range that overlaps another slot returns
+      `409` `slot-booked`.
+  license:
+    name: Apache 2.0
+    url: https://www.apache.org/licenses/LICENSE-2.0.html
+servers:
+  - url: http://localhost:8080
+    description: Local development
+tags:
+  - name: Users
+    description: Create and retrieve users.
+  - name: Time slots
+    description: Manage the time slots in a user's personal calendar.
+  - name: Meetings
+    description: Book meetings from free slots and list a user's meetings.
+  - name: Availability
+    description: Free/busy view of a user's slots over a period.
+paths:
+  /api/v1/users:
+    post:
+      tags: [Users]
+      operationId: createUser
+      summary: Create a user
+      description: Creates a user. The email address must be unique (compared case-insensitively) and is stored in lower case.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UserCreateRequest'
+            examples:
+              alice:
+                summary: A new user
+                value:
+                  name: Alice Example
+                  email: alice@example.com
+      responses:
+        '201':
+          description: User created.
+          headers:
+            Location:
+              description: URL of the created user.
+              schema:
+                type: string
+                format: uri-reference
+                examples: [/api/v1/users/3f2b8c1e-5a47-4d3e-9b1a-7c2d4e6f8a10]
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/User'
+              examples:
+                alice:
+                  value:
+                    id: 3f2b8c1e-5a47-4d3e-9b1a-7c2d4e6f8a10
+                    name: Alice Example
+                    email: alice@example.com
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '409':
+          description: A user with this email address already exists.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetail'
+              examples:
+                emailTaken:
+                  value:
+                    type: urn:mini-dood:problem:email-already-registered
+                    title: Email already registered
+                    status: 409
+                    detail: A user with email 'alice@example.com' already exists.
+                    instance: /api/v1/users
+  /api/v1/users/{userId}:
+    parameters:
+      - $ref: '#/components/parameters/UserId'
+    get:
+      tags: [Users]
+      operationId: getUser
+      summary: Retrieve a user
+      responses:
+        '200':
+          description: The user.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/User'
+              examples:
+                alice:
+                  value:
+                    id: 3f2b8c1e-5a47-4d3e-9b1a-7c2d4e6f8a10
+                    name: Alice Example
+                    email: alice@example.com
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/UserNotFound'
+  /api/v1/users/{userId}/slots:
+    parameters:
+      - $ref: '#/components/parameters/UserId'
+    post:
+      tags: [Time slots]
+      operationId: createSlot
+      summary: Create a time slot
+      description: |
+        Creates a time slot in the user's calendar. `status` defaults to `FREE`.
+        Rejected with `400` if `endTime` is not after `startTime` and with `409` if the slot overlaps
+        an existing slot of the same user. Adjacent slots are allowed.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TimeSlotCreateRequest'
+            examples:
+              freeSlot:
+                summary: A free one-hour slot
+                value:
+                  startTime: '2026-11-02T09:00:00Z'
+                  endTime: '2026-11-02T10:00:00Z'
+      responses:
+        '201':
+          description: Time slot created.
+          headers:
+            Location:
+              description: URL of the created slot.
+              schema:
+                type: string
+                format: uri-reference
+                examples: [/api/v1/users/3f2b8c1e-5a47-4d3e-9b1a-7c2d4e6f8a10/slots/7d9e2f4a-1b3c-4e5d-8f6a-0a1b2c3d4e5f]
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TimeSlot'
+              examples:
+                freeSlot:
+                  value:
+                    id: 7d9e2f4a-1b3c-4e5d-8f6a-0a1b2c3d4e5f
+                    userId: 3f2b8c1e-5a47-4d3e-9b1a-7c2d4e6f8a10
+                    startTime: '2026-11-02T09:00:00Z'
+                    endTime: '2026-11-02T10:00:00Z'
+                    status: FREE
+                    createdAt: '2026-10-17T20:15:30.123456Z'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/UserNotFound'
+        '409':
+          $ref: '#/components/responses/SlotOverlap'
+    get:
+      tags: [Time slots]
+      operationId: listSlots
+      summary: List time slots within a time range
+      description: Returns the user's slots that intersect `[from, to)`, sorted by `startTime`. Slots are returned whole, not clipped to the range.
+      parameters:
+        - $ref: '#/components/parameters/From'
+        - $ref: '#/components/parameters/To'
+      responses:
+        '200':
+          description: The slots intersecting the range. Empty if there are none.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/TimeSlot'
+              examples:
+                oneSlot:
+                  value:
+                    - id: 7d9e2f4a-1b3c-4e5d-8f6a-0a1b2c3d4e5f
+                      userId: 3f2b8c1e-5a47-4d3e-9b1a-7c2d4e6f8a10
+                      startTime: '2026-11-02T09:00:00Z'
+                      endTime: '2026-11-02T10:00:00Z'
+                      status: FREE
+                      createdAt: '2026-10-17T20:15:30.123456Z'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/UserNotFound'
+  /api/v1/users/{userId}/slots/{slotId}:
+    parameters:
+      - $ref: '#/components/parameters/UserId'
+      - $ref: '#/components/parameters/SlotId'
+    get:
+      tags: [Time slots]
+      operationId: getSlot
+      summary: Retrieve a time slot
+      description: Returns the slot if it belongs to the user; otherwise `404`.
+      responses:
+        '200':
+          description: The time slot.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TimeSlot'
+              examples:
+                busySlot:
+                  value:
+                    id: 7d9e2f4a-1b3c-4e5d-8f6a-0a1b2c3d4e5f
+                    userId: 3f2b8c1e-5a47-4d3e-9b1a-7c2d4e6f8a10
+                    startTime: '2026-11-02T09:00:00Z'
+                    endTime: '2026-11-02T10:00:00Z'
+                    status: BUSY
+                    createdAt: '2026-10-17T20:15:30.123456Z'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/SlotOrUserNotFound'
+    put:
+      tags: [Time slots]
+      operationId: updateSlot
+      summary: Update a time slot
+      description: |
+        Replaces the slot's time range. `status` is optional; when omitted the current status is kept.
+        The same validation and overlap rules as on creation apply; the slot itself is ignored when
+        checking for overlaps. A slot that has been booked by a meeting cannot be updated: any PUT on it
+        returns `409` (`slot-booked`), even when nothing would change.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TimeSlotUpdateRequest'
+            examples:
+              shift:
+                summary: Move the slot by thirty minutes
+                value:
+                  startTime: '2026-11-02T09:30:00Z'
+                  endTime: '2026-11-02T10:30:00Z'
+      responses:
+        '200':
+          description: Time slot updated.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TimeSlot'
+              examples:
+                shifted:
+                  value:
+                    id: 7d9e2f4a-1b3c-4e5d-8f6a-0a1b2c3d4e5f
+                    userId: 3f2b8c1e-5a47-4d3e-9b1a-7c2d4e6f8a10
+                    startTime: '2026-11-02T09:30:00Z'
+                    endTime: '2026-11-02T10:30:00Z'
+                    status: FREE
+                    createdAt: '2026-10-17T20:15:30.123456Z'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/SlotOrUserNotFound'
+        '409':
+          description: The slot is already booked by a meeting (`slot-booked`), or the new time range overlaps another slot of the user (`slot-overlap`). `slot-booked` takes precedence when both apply.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetail'
+              examples:
+                overlap:
+                  value:
+                    type: urn:mini-dood:problem:slot-overlap
+                    title: Time slot overlaps an existing slot
+                    status: 409
+                    detail: The requested time range overlaps an existing slot of this user.
+                    instance: /api/v1/users/3f2b8c1e-5a47-4d3e-9b1a-7c2d4e6f8a10/slots/7d9e2f4a-1b3c-4e5d-8f6a-0a1b2c3d4e5f
+                booked:
+                  value:
+                    type: urn:mini-dood:problem:slot-booked
+                    title: Time slot is booked by a meeting
+                    status: 409
+                    detail: The slot is booked by a meeting and cannot be changed.
+                    instance: /api/v1/users/3f2b8c1e-5a47-4d3e-9b1a-7c2d4e6f8a10/slots/7d9e2f4a-1b3c-4e5d-8f6a-0a1b2c3d4e5f
+    delete:
+      tags: [Time slots]
+      operationId: deleteSlot
+      summary: Delete a time slot
+      description: Deletes the slot. A slot that has been booked by a meeting cannot be deleted (`409`).
+      responses:
+        '204':
+          description: Time slot deleted.
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/SlotOrUserNotFound'
+        '409':
+          $ref: '#/components/responses/SlotBooked'
+  /api/v1/users/{userId}/slots/{slotId}/availability:
+    parameters:
+      - $ref: '#/components/parameters/UserId'
+      - $ref: '#/components/parameters/SlotId'
+    patch:
+      tags: [Time slots]
+      operationId: updateSlotAvailability
+      summary: Change a slot's availability status
+      description: |
+        Sets the slot to `FREE` or `BUSY` without touching its time range. A slot that has been booked by a
+        meeting cannot be changed: any PATCH on it returns `409` (`slot-booked`), even when the requested
+        status equals the current one. For a slot that is not booked, setting the status it already has is a
+        no-op that returns `200`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TimeSlotAvailabilityRequest'
+            examples:
+              markBusy:
+                value:
+                  status: BUSY
+      responses:
+        '200':
+          description: Availability changed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TimeSlot'
+              examples:
+                busy:
+                  value:
+                    id: 7d9e2f4a-1b3c-4e5d-8f6a-0a1b2c3d4e5f
+                    userId: 3f2b8c1e-5a47-4d3e-9b1a-7c2d4e6f8a10
+                    startTime: '2026-11-02T09:00:00Z'
+                    endTime: '2026-11-02T10:00:00Z'
+                    status: BUSY
+                    createdAt: '2026-10-17T20:15:30.123456Z'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/SlotOrUserNotFound'
+        '409':
+          $ref: '#/components/responses/SlotBooked'
+  /api/v1/users/{userId}/meetings:
+    parameters:
+      - $ref: '#/components/parameters/UserId'
+    post:
+      tags: [Meetings]
+      operationId: createMeeting
+      summary: Create a meeting from a free slot
+      description: |
+        The user in the path is the organizer. The referenced slot must belong to the organizer and be
+        `FREE`. The meeting takes the slot's start and end. The meeting insert and the slot's change to
+        `BUSY` happen in one database transaction. Participant IDs must refer to existing users (otherwise
+        `404`). A list that contains the organizer, the same user twice or a `null` entry is rejected with `400`
+        `validation-error` (`errors[].field` = `participantIds`). Omitting `participantIds` is the same as
+        `[]`, and so is an explicit `null`. Participant IDs are returned as lower-case UUIDs sorted ascending.
+        Participants' availability is not checked or reserved.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MeetingCreateRequest'
+            examples:
+              planning:
+                value:
+                  slotId: 7d9e2f4a-1b3c-4e5d-8f6a-0a1b2c3d4e5f
+                  title: Sprint planning
+                  description: Plan the next sprint.
+                  participantIds: [9a1c7e55-2b3d-4f60-8c4e-1d2f3a4b5c6d]
+      responses:
+        '201':
+          description: Meeting created and the slot marked `BUSY`.
+          headers:
+            Location:
+              description: URL of the created meeting.
+              schema:
+                type: string
+                format: uri-reference
+                examples: [/api/v1/users/3f2b8c1e-5a47-4d3e-9b1a-7c2d4e6f8a10/meetings/c4d5e6f7-0a1b-4c2d-9e3f-4a5b6c7d8e9f]
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Meeting'
+              examples:
+                planning:
+                  value:
+                    id: c4d5e6f7-0a1b-4c2d-9e3f-4a5b6c7d8e9f
+                    title: Sprint planning
+                    description: Plan the next sprint.
+                    organizerId: 3f2b8c1e-5a47-4d3e-9b1a-7c2d4e6f8a10
+                    slotId: 7d9e2f4a-1b3c-4e5d-8f6a-0a1b2c3d4e5f
+                    startTime: '2026-11-02T09:00:00Z'
+                    endTime: '2026-11-02T10:00:00Z'
+                    participantIds: [9a1c7e55-2b3d-4f60-8c4e-1d2f3a4b5c6d]
+                    createdAt: '2026-10-17T20:20:00.654321Z'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          description: The organizer, the slot (or a slot owned by another user) or a participant does not exist. Checked in that order.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetail'
+              examples:
+                organizerNotFound:
+                  value:
+                    type: urn:mini-dood:problem:user-not-found
+                    title: User not found
+                    status: 404
+                    detail: User 3f2b8c1e-5a47-4d3e-9b1a-7c2d4e6f8a10 was not found.
+                    instance: /api/v1/users/3f2b8c1e-5a47-4d3e-9b1a-7c2d4e6f8a10/meetings
+                slotNotFound:
+                  value:
+                    type: urn:mini-dood:problem:slot-not-found
+                    title: Time slot not found
+                    status: 404
+                    detail: Time slot 7d9e2f4a-1b3c-4e5d-8f6a-0a1b2c3d4e5f was not found for user 3f2b8c1e-5a47-4d3e-9b1a-7c2d4e6f8a10.
+                    instance: /api/v1/users/3f2b8c1e-5a47-4d3e-9b1a-7c2d4e6f8a10/meetings
+                participantNotFound:
+                  value:
+                    type: urn:mini-dood:problem:user-not-found
+                    title: User not found
+                    status: 404
+                    detail: Participant user(s) not found - 11111111-1111-4111-8111-111111111111
+                    instance: /api/v1/users/3f2b8c1e-5a47-4d3e-9b1a-7c2d4e6f8a10/meetings
+        '409':
+          description: The slot is not `FREE` (already `BUSY`).
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetail'
+              examples:
+                slotNotFree:
+                  value:
+                    type: urn:mini-dood:problem:slot-not-free
+                    title: Time slot is not free
+                    status: 409
+                    detail: Time slot 7d9e2f4a-1b3c-4e5d-8f6a-0a1b2c3d4e5f is BUSY and cannot be booked.
+                    instance: /api/v1/users/3f2b8c1e-5a47-4d3e-9b1a-7c2d4e6f8a10/meetings
+    get:
+      tags: [Meetings]
+      operationId: listMeetings
+      summary: List a user's meetings within a time range
+      description: |
+        Returns the meetings that intersect `[from, to)` and that the user organizes or participates in,
+        sorted by `startTime`. Meetings are returned whole, not clipped.
+      parameters:
+        - $ref: '#/components/parameters/From'
+        - $ref: '#/components/parameters/To'
+      responses:
+        '200':
+          description: The meetings intersecting the range. Empty if there are none.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Meeting'
+              examples:
+                oneMeeting:
+                  value:
+                    - id: c4d5e6f7-0a1b-4c2d-9e3f-4a5b6c7d8e9f
+                      title: Sprint planning
+                      description: Plan the next sprint.
+                      organizerId: 3f2b8c1e-5a47-4d3e-9b1a-7c2d4e6f8a10
+                      slotId: 7d9e2f4a-1b3c-4e5d-8f6a-0a1b2c3d4e5f
+                      startTime: '2026-11-02T09:00:00Z'
+                      endTime: '2026-11-02T10:00:00Z'
+                      participantIds: [9a1c7e55-2b3d-4f60-8c4e-1d2f3a4b5c6d]
+                      createdAt: '2026-10-17T20:20:00.654321Z'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/UserNotFound'
+  /api/v1/users/{userId}/meetings/{meetingId}:
+    parameters:
+      - $ref: '#/components/parameters/UserId'
+      - $ref: '#/components/parameters/MeetingId'
+    get:
+      tags: [Meetings]
+      operationId: getMeeting
+      summary: Retrieve a meeting
+      description: Returns the meeting if the user is its organizer or a participant; otherwise `404`.
+      responses:
+        '200':
+          description: The meeting.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Meeting'
+              examples:
+                planning:
+                  value:
+                    id: c4d5e6f7-0a1b-4c2d-9e3f-4a5b6c7d8e9f
+                    title: Sprint planning
+                    description: Plan the next sprint.
+                    organizerId: 3f2b8c1e-5a47-4d3e-9b1a-7c2d4e6f8a10
+                    slotId: 7d9e2f4a-1b3c-4e5d-8f6a-0a1b2c3d4e5f
+                    startTime: '2026-11-02T09:00:00Z'
+                    endTime: '2026-11-02T10:00:00Z'
+                    participantIds: [9a1c7e55-2b3d-4f60-8c4e-1d2f3a4b5c6d]
+                    createdAt: '2026-10-17T20:20:00.654321Z'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          description: The user does not exist (`user-not-found`, checked first), or the meeting does not exist or does not involve the user (`meeting-not-found`).
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetail'
+              examples:
+                userNotFound:
+                  value:
+                    type: urn:mini-dood:problem:user-not-found
+                    title: User not found
+                    status: 404
+                    detail: User 3f2b8c1e-5a47-4d3e-9b1a-7c2d4e6f8a10 was not found.
+                    instance: /api/v1/users/3f2b8c1e-5a47-4d3e-9b1a-7c2d4e6f8a10/meetings/c4d5e6f7-0a1b-4c2d-9e3f-4a5b6c7d8e9f
+                meetingNotFound:
+                  value:
+                    type: urn:mini-dood:problem:meeting-not-found
+                    title: Meeting not found
+                    status: 404
+                    detail: Meeting c4d5e6f7-0a1b-4c2d-9e3f-4a5b6c7d8e9f was not found for user 3f2b8c1e-5a47-4d3e-9b1a-7c2d4e6f8a10.
+                    instance: /api/v1/users/3f2b8c1e-5a47-4d3e-9b1a-7c2d4e6f8a10/meetings/c4d5e6f7-0a1b-4c2d-9e3f-4a5b6c7d8e9f
+  /api/v1/users/{userId}/availability:
+    parameters:
+      - $ref: '#/components/parameters/UserId'
+    get:
+      tags: [Availability]
+      operationId: getAvailability
+      summary: Query a user's free/busy slots over a period
+      description: |
+        Returns the user's explicitly defined slots that intersect `[from, to)` with their start, end and
+        status, sorted by `startTime`. Slots that start before `from` or end after `to` are included whole.
+        Time not covered by any slot is **unknown**, not free; no gaps are inferred and no intervals are merged.
+      parameters:
+        - $ref: '#/components/parameters/From'
+        - $ref: '#/components/parameters/To'
+      responses:
+        '200':
+          description: The availability for the period. `slots` is empty if the user defined no slot in it.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Availability'
+              examples:
+                afterBooking:
+                  value:
+                    userId: 3f2b8c1e-5a47-4d3e-9b1a-7c2d4e6f8a10
+                    from: '2026-11-02T00:00:00Z'
+                    to: '2026-11-03T00:00:00Z'
+                    slots:
+                      - startTime: '2026-11-02T09:00:00Z'
+                        endTime: '2026-11-02T10:00:00Z'
+                        status: BUSY
+                      - startTime: '2026-11-02T14:00:00Z'
+                        endTime: '2026-11-02T15:00:00Z'
+                        status: FREE
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/UserNotFound'
+components:
+  parameters:
+    UserId:
+      name: userId
+      in: path
+      required: true
+      description: Identifier of the user. It identifies the resource; it is not an authorization mechanism.
+      schema:
+        type: string
+        format: uuid
+        examples: [3f2b8c1e-5a47-4d3e-9b1a-7c2d4e6f8a10]
+    SlotId:
+      name: slotId
+      in: path
+      required: true
+      description: Identifier of the time slot.
+      schema:
+        type: string
+        format: uuid
+        examples: [7d9e2f4a-1b3c-4e5d-8f6a-0a1b2c3d4e5f]
+    MeetingId:
+      name: meetingId
+      in: path
+      required: true
+      description: Identifier of the meeting.
+      schema:
+        type: string
+        format: uuid
+        examples: [c4d5e6f7-0a1b-4c2d-9e3f-4a5b6c7d8e9f]
+    From:
+      name: from
+      in: query
+      required: true
+      description: Inclusive start of the requested range (ISO-8601 date-time with offset). Must be before `to`. A `+` in the offset must be sent as `%2B`; `Z` is recommended.
+      schema:
+        type: string
+        format: date-time
+        examples: ['2026-11-02T00:00:00Z']
+    To:
+      name: to
+      in: query
+      required: true
+      description: Exclusive end of the requested range (ISO-8601 date-time with offset). Must be after `from`. A `+` in the offset must be sent as `%2B`; `Z` is recommended.
+      schema:
+        type: string
+        format: date-time
+        examples: ['2026-11-03T00:00:00Z']
+  responses:
+    BadRequest:
+      description: |
+        Invalid input. `validation-error` (with `errors[]`): a failed constraint or rule on readable input,
+        for example `endTime` not after `startTime`, `from` not before `to`, a missing required property or
+        query parameter, or an organizer or duplicate in `participantIds`. `malformed-request` (no `errors[]`):
+        unreadable input, for example invalid JSON, a wrong JSON type, an unknown property, an invalid enum
+        value, a malformed UUID or a malformed timestamp. See Conventions.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetail'
+          examples:
+            validation:
+              summary: Field validation failed
+              value:
+                type: urn:mini-dood:problem:validation-error
+                title: Validation failed
+                status: 400
+                detail: The request contains invalid fields.
+                instance: /api/v1/users
+                errors:
+                  - field: email
+                    message: must be a well-formed email address
+            invalidRange:
+              summary: End time is not after start time
+              value:
+                type: urn:mini-dood:problem:validation-error
+                title: Validation failed
+                status: 400
+                detail: endTime must be after startTime.
+                instance: /api/v1/users/3f2b8c1e-5a47-4d3e-9b1a-7c2d4e6f8a10/slots
+                errors:
+                  - field: endTime
+                    message: must be after startTime
+            malformed:
+              summary: Unreadable body, bad UUID or bad timestamp
+              value:
+                type: urn:mini-dood:problem:malformed-request
+                title: Malformed request
+                status: 400
+                detail: "Parameter 'from' must be an ISO-8601 date-time."
+                instance: /api/v1/users/3f2b8c1e-5a47-4d3e-9b1a-7c2d4e6f8a10/availability
+    UserNotFound:
+      description: The user does not exist.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetail'
+          examples:
+            userNotFound:
+              value:
+                type: urn:mini-dood:problem:user-not-found
+                title: User not found
+                status: 404
+                detail: User 3f2b8c1e-5a47-4d3e-9b1a-7c2d4e6f8a10 was not found.
+                instance: /api/v1/users/3f2b8c1e-5a47-4d3e-9b1a-7c2d4e6f8a10
+    SlotOrUserNotFound:
+      description: The user does not exist, or the slot does not exist or belongs to another user.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetail'
+          examples:
+            slotNotFound:
+              value:
+                type: urn:mini-dood:problem:slot-not-found
+                title: Time slot not found
+                status: 404
+                detail: Time slot 7d9e2f4a-1b3c-4e5d-8f6a-0a1b2c3d4e5f was not found for user 3f2b8c1e-5a47-4d3e-9b1a-7c2d4e6f8a10.
+                instance: /api/v1/users/3f2b8c1e-5a47-4d3e-9b1a-7c2d4e6f8a10/slots/7d9e2f4a-1b3c-4e5d-8f6a-0a1b2c3d4e5f
+            userNotFound:
+              value:
+                type: urn:mini-dood:problem:user-not-found
+                title: User not found
+                status: 404
+                detail: User 3f2b8c1e-5a47-4d3e-9b1a-7c2d4e6f8a10 was not found.
+                instance: /api/v1/users/3f2b8c1e-5a47-4d3e-9b1a-7c2d4e6f8a10/slots/7d9e2f4a-1b3c-4e5d-8f6a-0a1b2c3d4e5f
+    SlotOverlap:
+      description: The slot overlaps an existing slot of the same user.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetail'
+          examples:
+            overlap:
+              value:
+                type: urn:mini-dood:problem:slot-overlap
+                title: Time slot overlaps an existing slot
+                status: 409
+                detail: The requested time range overlaps an existing slot of this user.
+                instance: /api/v1/users/3f2b8c1e-5a47-4d3e-9b1a-7c2d4e6f8a10/slots
+    SlotBooked:
+      description: The slot is booked by a meeting and cannot be changed or deleted.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetail'
+          examples:
+            booked:
+              value:
+                type: urn:mini-dood:problem:slot-booked
+                title: Time slot is booked by a meeting
+                status: 409
+                detail: The slot is booked by a meeting and cannot be changed.
+                instance: /api/v1/users/3f2b8c1e-5a47-4d3e-9b1a-7c2d4e6f8a10/slots/7d9e2f4a-1b3c-4e5d-8f6a-0a1b2c3d4e5f
+  schemas:
+    UserCreateRequest:
+      type: object
+      additionalProperties: false
+      required: [name, email]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 100
+          pattern: '\S'
+          description: Display name. Must not be blank.
+          examples: [Alice Example]
+        email:
+          type: string
+          format: email
+          maxLength: 254
+          description: Unique email address (case-insensitive). Stored in lower case.
+          examples: [alice@example.com]
+    User:
+      type: object
+      required: [id, name, email]
+      properties:
+        id:
+          type: string
+          format: uuid
+          readOnly: true
+          examples: [3f2b8c1e-5a47-4d3e-9b1a-7c2d4e6f8a10]
+        name:
+          type: string
+          examples: [Alice Example]
+        email:
+          type: string
+          format: email
+          examples: [alice@example.com]
+    TimeSlotStatus:
+      type: string
+      enum: [FREE, BUSY]
+      description: |
+        `FREE`: the user is available. `BUSY`: the user is not available, or the slot has been booked by a meeting.
+    TimeSlotCreateRequest:
+      type: object
+      additionalProperties: false
+      required: [startTime, endTime]
+      properties:
+        startTime:
+          type: string
+          format: date-time
+          description: Start of the slot (inclusive).
+          examples: ['2026-11-02T09:00:00Z']
+        endTime:
+          type: string
+          format: date-time
+          description: End of the slot (exclusive). Must be after `startTime`.
+          examples: ['2026-11-02T10:00:00Z']
+        status:
+          $ref: '#/components/schemas/TimeSlotStatus'
+          default: FREE
+    TimeSlotUpdateRequest:
+      type: object
+      additionalProperties: false
+      required: [startTime, endTime]
+      properties:
+        startTime:
+          type: string
+          format: date-time
+          examples: ['2026-11-02T09:30:00Z']
+        endTime:
+          type: string
+          format: date-time
+          description: Must be after `startTime`.
+          examples: ['2026-11-02T10:30:00Z']
+        status:
+          $ref: '#/components/schemas/TimeSlotStatus'
+          description: Optional. When omitted, the current status is kept.
+    TimeSlotAvailabilityRequest:
+      type: object
+      additionalProperties: false
+      required: [status]
+      properties:
+        status:
+          $ref: '#/components/schemas/TimeSlotStatus'
+    TimeSlot:
+      type: object
+      required: [id, userId, startTime, endTime, status, createdAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+          readOnly: true
+          examples: [7d9e2f4a-1b3c-4e5d-8f6a-0a1b2c3d4e5f]
+        userId:
+          type: string
+          format: uuid
+          description: Owner of the slot.
+          examples: [3f2b8c1e-5a47-4d3e-9b1a-7c2d4e6f8a10]
+        startTime:
+          type: string
+          format: date-time
+          examples: ['2026-11-02T09:00:00Z']
+        endTime:
+          type: string
+          format: date-time
+          examples: ['2026-11-02T10:00:00Z']
+        status:
+          $ref: '#/components/schemas/TimeSlotStatus'
+        createdAt:
+          type: string
+          format: date-time
+          readOnly: true
+          examples: ['2026-10-17T20:15:30.123456Z']
+    MeetingCreateRequest:
+      type: object
+      additionalProperties: false
+      required: [slotId, title]
+      properties:
+        slotId:
+          type: string
+          format: uuid
+          description: A `FREE` slot owned by the organizer (the user in the path).
+          examples: [7d9e2f4a-1b3c-4e5d-8f6a-0a1b2c3d4e5f]
+        title:
+          type: string
+          minLength: 1
+          maxLength: 200
+          pattern: '\S'
+          description: Meeting title. Must not be blank.
+          examples: [Sprint planning]
+        description:
+          type: [string, 'null']
+          maxLength: 2000
+          description: Optional. Omitted and `null` both mean no description.
+          examples: [Plan the next sprint.]
+        participantIds:
+          type: [array, 'null']
+          maxItems: 100
+          uniqueItems: true
+          default: []
+          description: IDs of existing users invited to the meeting. Must not contain the organizer or duplicates (`400`); unknown users are `404`. Optional; omitted and `null` both mean no participants.
+          items:
+            type: string
+            format: uuid
+          examples:
+            - [9a1c7e55-2b3d-4f60-8c4e-1d2f3a4b5c6d]
+    Meeting:
+      type: object
+      required: [id, title, description, organizerId, slotId, startTime, endTime, participantIds, createdAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+          readOnly: true
+          examples: [c4d5e6f7-0a1b-4c2d-9e3f-4a5b6c7d8e9f]
+        title:
+          type: string
+          examples: [Sprint planning]
+        description:
+          type: [string, 'null']
+          description: Always present; `null` when no description was given.
+          examples: [Plan the next sprint.]
+        organizerId:
+          type: string
+          format: uuid
+          examples: [3f2b8c1e-5a47-4d3e-9b1a-7c2d4e6f8a10]
+        slotId:
+          type: string
+          format: uuid
+          description: The organizer's slot that was reserved for this meeting.
+          examples: [7d9e2f4a-1b3c-4e5d-8f6a-0a1b2c3d4e5f]
+        startTime:
+          type: string
+          format: date-time
+          description: Copied from the slot at booking time.
+          examples: ['2026-11-02T09:00:00Z']
+        endTime:
+          type: string
+          format: date-time
+          description: Copied from the slot at booking time.
+          examples: ['2026-11-02T10:00:00Z']
+        participantIds:
+          type: array
+          uniqueItems: true
+          items:
+            type: string
+            format: uuid
+          examples:
+            - [9a1c7e55-2b3d-4f60-8c4e-1d2f3a4b5c6d]
+        createdAt:
+          type: string
+          format: date-time
+          readOnly: true
+          examples: ['2026-10-17T20:20:00.654321Z']
+    AvailabilitySlot:
+      type: object
+      required: [startTime, endTime, status]
+      properties:
+        startTime:
+          type: string
+          format: date-time
+          examples: ['2026-11-02T09:00:00Z']
+        endTime:
+          type: string
+          format: date-time
+          examples: ['2026-11-02T10:00:00Z']
+        status:
+          $ref: '#/components/schemas/TimeSlotStatus'
+    Availability:
+      type: object
+      required: [userId, from, to, slots]
+      properties:
+        userId:
+          type: string
+          format: uuid
+          examples: [3f2b8c1e-5a47-4d3e-9b1a-7c2d4e6f8a10]
+        from:
+          type: string
+          format: date-time
+          description: Echo of the requested `from`, in UTC.
+          examples: ['2026-11-02T00:00:00Z']
+        to:
+          type: string
+          format: date-time
+          description: Echo of the requested `to`, in UTC.
+          examples: ['2026-11-03T00:00:00Z']
+        slots:
+          type: array
+          description: Slots intersecting the period, sorted by `startTime`. Gaps between them are unknown availability.
+          items:
+            $ref: '#/components/schemas/AvailabilitySlot'
+    ProblemDetail:
+      type: object
+      description: RFC 9457 Problem Details.
+      required: [type, title, status]
+      properties:
+        type:
+          type: string
+          format: uri
+          description: Problem type identifier. `about:blank` is used for errors raised by the framework rather than by a domain rule (see Conventions).
+          enum:
+            - about:blank
+            - urn:mini-dood:problem:validation-error
+            - urn:mini-dood:problem:malformed-request
+            - urn:mini-dood:problem:user-not-found
+            - urn:mini-dood:problem:slot-not-found
+            - urn:mini-dood:problem:meeting-not-found
+            - urn:mini-dood:problem:email-already-registered
+            - urn:mini-dood:problem:slot-overlap
+            - urn:mini-dood:problem:slot-not-free
+            - urn:mini-dood:problem:slot-booked
+            - urn:mini-dood:problem:internal-error
+        title:
+          type: string
+          description: Short, human-readable summary of the problem type.
+        status:
+          type: integer
+          minimum: 400
+          maximum: 599
+          description: HTTP status code.
+        detail:
+          type: string
+          description: Human-readable explanation specific to this occurrence.
+        instance:
+          type: string
+          description: Request path that produced the problem.
+        errors:
+          type: array
+          description: Per-field violations. Only present for `validation-error`.
+          items:
+            $ref: '#/components/schemas/FieldError'
+    FieldError:
+      type: object
+      required: [field, message]
+      properties:
+        field:
+          type: string
+          description: Name of the invalid request field or parameter.
+          examples: [email]
+        message:
+          type: string
+          examples: [must be a well-formed email address]

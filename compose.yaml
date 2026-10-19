@@ -1,24 +1,36 @@
+# `docker compose up` starts PostgreSQL (database and user are created from the variables below)
+# and the API, which creates the schema through Flyway on startup.
+# To run the API from Gradle instead, start only the database: `docker compose up -d postgres`.
+# Values come from the environment (or a local .env file, see .env.example).
 services:
   postgres:
     image: postgres:17-alpine
     environment:
-      POSTGRES_DB: postgres
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
-    ports: ["5433:5433"]
-    volumes: [postgres_data:/var/lib/postgresql/data]
+      POSTGRES_DB: ${DB_NAME:-minidood}
+      POSTGRES_USER: ${DB_USER:-minidood}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-minidood}
+    ports:
+      - "${DB_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
       interval: 5s
       timeout: 3s
       retries: 15
   app:
     build: .
+    container_name: mini-dood-app
     environment:
-      DB_URL: jdbc:postgresql://postgres:5433/postgres
-      DB_USERNAME: postgres
-      DB_PASSWORD: postgres
-    ports: ["8080:8080"]
+      # Inside the compose network the database is reached by service name on its container port,
+      # regardless of DB_HOST / DB_PORT (those describe how the host reaches it).
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: ${DB_NAME:-minidood}
+      DB_USER: ${DB_USER:-minidood}
+      DB_PASSWORD: ${DB_PASSWORD:-minidood}
+    ports:
+      - "${APP_PORT:-8080}:8080"
     depends_on:
       postgres:
         condition: service_healthy
