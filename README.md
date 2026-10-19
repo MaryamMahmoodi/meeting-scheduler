@@ -18,7 +18,7 @@ A mini Doodle-style REST API using Java 25, Spring Boot, PostgreSQL, Flyway, Doc
 - `application/port/out`: persistence port.
 - `application/service`: use-case orchestration.
 - `adapter/in/web`: REST controllers and error mapping.
-- `adapter/out/persistence`: PostgreSQL JDBC adapter.
+- `adapter/outbound/persistence`: PostgreSQL persistence layer (kept flat intentionally to avoid unnecessary nested folder depth for this domain scale).
 - Flyway owns the schema.
 
 ## Run

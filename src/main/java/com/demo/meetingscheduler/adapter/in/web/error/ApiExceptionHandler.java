@@ -12,6 +12,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import org.springframework.beans.TypeMismatchException;
+import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.HttpStatusCode;
@@ -55,6 +56,25 @@ public class ApiExceptionHandler extends ResponseEntityExceptionHandler {
 		ProblemDetail problem = problem(HttpStatus.INTERNAL_SERVER_ERROR, ProblemType.INTERNAL_ERROR,
 				"An unexpected error occurred.");
 		return handleExceptionInternal(ex, problem, new HttpHeaders(), HttpStatus.INTERNAL_SERVER_ERROR, request);
+	}
+
+	@ExceptionHandler(DataIntegrityViolationException.class)
+	ResponseEntity<Object> handleDataIntegrityViolation(DataIntegrityViolationException ex, WebRequest request) {
+		String message = ex.getMostSpecificCause().getMessage();
+		com.demo.meetingscheduler.domain.exception.ErrorCode errorCode;
+		String detail;
+
+		// Map database constraint errors to corresponding domain ErrorCodes
+		if (message != null && (message.contains("users_email_key") || message.contains("email"))) {
+			errorCode = com.demo.meetingscheduler.domain.exception.ErrorCode.EMAIL_ALREADY_REGISTERED;
+			detail = "Email is already registered.";
+		} else {
+			errorCode = com.demo.meetingscheduler.domain.exception.ErrorCode.SLOT_OVERLAP;
+			detail = "A resource conflict or overlap occurred.";
+		}
+
+		ProblemDetail problem = problem(HttpStatus.CONFLICT, ProblemType.of(errorCode), detail);
+		return handleExceptionInternal(ex, problem, new HttpHeaders(), HttpStatus.CONFLICT, request);
 	}
 
 	@Override
