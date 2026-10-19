@@ -28,7 +28,7 @@ Requirements: Docker with Compose. For local Gradle commands, Java 25 and Gradle
 docker compose up --build -d
 docker compose ps
 ```
-API: http://localhost:8080/api  
+Swagger UI (Interactive API Docs): http://localhost:8080/swagger-ui/index.html
 Health: http://localhost:8080/actuator/health  
 Stop: `docker compose down`
 
